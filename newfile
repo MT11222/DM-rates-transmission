@@ -1,0 +1,612 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def parse_ticker(ticker_string):
+    # extracts date from ticker
+    MONTH_CODES = {
+        'F': 1, 'G': 2, 'H': 3, 'J': 4, 'K': 5, 'M': 6,
+        'N': 7, 'Q': 8, 'U': 9, 'V': 10, 'X': 11, 'Z': 12
+    }
+    YEAR_CODES = {
+        '5': 2025, '6': 2026, '7': 2027, '8': 2028,
+        '9': 2029, '0': 2030
+    }
+
+    ticker = ticker_string.split()[0]  # take first part before space
+    if not isinstance(ticker, str) or len(ticker) < 3:
+        raise ValueError("Invalid ticker")
+
+    month_character = ticker[-2].upper()
+    year_character = ticker[-1]
+
+    if month_character not in MONTH_CODES or year_character not in YEAR_CODES:
+        raise ValueError(f"Invalid month/year code in ticker '{ticker}'")
+
+    return YEAR_CODES[year_character], MONTH_CODES[month_character]
+
+
+class ThreeMonthFutureModel:
+    def __init__(self, x, probabilities, manual_basis=None):
+        self.x = x
+        self.active_ticker = self._get_active_future_ticker()
+        self.start_date, self.end_date = self._get_contract_dates()
+        # probabilities is now a list of all meeting probabilities in chronological order
+        # map probabilities to meeting dates (both pre-contract and intra-contract)
+        self.pre_contract_meetings, self.intra_contract_meetings = self._map_all_probs_to_dates(probabilities)
+        # to be defined in child classes
+        self.DAY_COUNT_CONVENTION = None
+        self.current_rate = self._get_current_rate()
+        # Use manual basis if provided, otherwise get from market
+        self.basis = manual_basis if manual_basis is not None else self._get_basis()
+
+    def _get_active_future_ticker(self) -> str:
+        IMM_MONTHS = {'H': 3, 'M': 6, 'U': 9, 'Z': 12}
+
+        # These are defined globally but needed for the mapping logic
+        MONTH_CODES = {
+            'F': 1, 'G': 2, 'H': 3, 'J': 4, 'K': 5, 'M': 6,
+            'N': 7, 'Q': 8, 'U': 9, 'V': 10, 'X': 11, 'Z': 12
+        }
+        YEAR_CODES = {
+            '5': 2025, '6': 2026, '7': 2027, '8': 2028,
+            '9': 2029, '0': 2030
+        }
+
+        # Parse the original user-provided ticker
+        year, month_num = parse_ticker(self.x)
+
+        active_year = year
+        active_month_num = None
+
+        # Find the first IMM month >= ticker's month
+        for imm_month in sorted(IMM_MONTHS.values()):
+            if imm_month >= month_num:
+                active_month_num = imm_month
+                break
+
+        # If no IMM month in current year, roll to next year March
+        if active_month_num is None:
+            active_month_num = 3  # March
+            active_year += 1
+
+        # Convert year/month back to codes
+        MONTH_CODES_INV = {v: k for k, v in MONTH_CODES.items()}
+        YEAR_CODES_INV = {v: str(k)[-1] for k, v in YEAR_CODES.items()}
+
+        active_month_char = MONTH_CODES_INV[active_month_num]
+        active_year_char = YEAR_CODES_INV[active_year]
+
+        # Reconstruct ticker string
+        base_root = self.x.split()[0][:-2]  # e.g. "SFR" from "SFRV5 Comdty"
+        active_ticker = f"{base_root}{active_month_char}{active_year_char} Comdty"
+
+        return active_ticker
+    
+
+    def _get_contract_dates(self):
+        # Pulls contract dates from BBG
+        start_date_table = blp.bdp(tickers=self.active_ticker, flds=['INT_RATE_FUT_START_DT'])
+        start_date = start_date_table['int_rate_fut_start_dt'].iloc[0]
+
+        end_date_table = blp.bdp(tickers=self.active_ticker, flds=['INT_RATE_FUT_END_DT'])
+        end_date = end_date_table['int_rate_fut_end_dt'].iloc[0]
+
+        start_date = pd.to_datetime(start_date)
+        end_date = pd.to_datetime(end_date)
+
+        return start_date, end_date
+
+    def _map_all_probs_to_dates(self, all_probs):
+        # maps ALL probabilities to meeting dates, splitting into pre-contract and intra-contract
+        today = pd.to_datetime(dt.date.today())
+        all_meeting_dates = self._get_meeting_dates()
+        
+        # Split meetings into pre-contract and intra-contract
+        pre_contract_dates = [date for date in all_meeting_dates if today < date < self.start_date]
+        intra_contract_dates = [date for date in all_meeting_dates if self.start_date <= date <= self.end_date]
+        
+        total_relevant_meetings = len(pre_contract_dates) + len(intra_contract_dates)
+        
+        if len(all_probs) != total_relevant_meetings:
+            raise ValueError(f"Expected {total_relevant_meetings} probability sets (pre-contract + intra-contract), got {len(all_probs)}")
+
+        # Map probabilities to dates
+        pre_contract_probs_dict = {}
+        for i in range(len(pre_contract_dates)):
+            pre_contract_probs_dict[pre_contract_dates[i]] = all_probs[i]
+        
+        intra_contract_probs_dict = {}
+        for i in range(len(intra_contract_dates)):
+            intra_contract_probs_dict[intra_contract_dates[i]] = all_probs[len(pre_contract_dates) + i]
+
+        return pre_contract_probs_dict, intra_contract_probs_dict
+
+    def _calculate_pre_contract_scenarios(self):
+        # Build probability paths through all pre-contract meetings
+        # Returns a dict of {rate: probability} for the rate at contract start
+        
+        if not self.pre_contract_meetings:
+            # No pre-contract meetings, just return current rate
+            return {self.current_rate: 1.0}
+        
+        # Start with current rate
+        paths = [{'rate': self.current_rate, 'prob': 1.0}]
+        
+        # Sort meetings chronologically
+        sorted_meeting_dates = sorted(self.pre_contract_meetings.keys())
+        
+        # Build paths through each pre-contract meeting
+        for meeting_date in sorted_meeting_dates:
+            new_paths = []
+            prob_dict = self.pre_contract_meetings[meeting_date]
+            
+            for path in paths:
+                for change_in_bps, action_prob in prob_dict.items():
+                    new_rate = path['rate'] + (change_in_bps / 100.0)
+                    new_paths.append({
+                        'rate': new_rate,
+                        'prob': path['prob'] * action_prob
+                    })
+            paths = new_paths
+        
+        # Convert to {rate: probability} format
+        scenarios = {}
+        for path in paths:
+            rate = path['rate']
+            prob = path['prob']
+            if rate in scenarios:
+                scenarios[rate] += prob
+            else:
+                scenarios[rate] = prob
+        
+        return scenarios
+
+    def _calculate_expected_compounding_factor(self, start_rate, intra_contract_meetings):
+        # Calculates expected compounding factor given start_rate with paths
+        paths = [{'rate': start_rate, 'prob': 1.0, 'factor': 1.0}]
+
+        for day in pd.date_range(self.start_date, self.end_date - pd.Timedelta(days=1)):
+            if day in intra_contract_meetings:
+                new_paths = []
+                prob_dict = intra_contract_meetings[day]
+
+                for path in paths:
+                    for change_in_bps, action_prob in prob_dict.items():
+                        # change_in_bps is now directly the bp change (e.g., -25, 0, +100)
+                        new_rate = path['rate'] + (change_in_bps / 100.0)
+                        new_paths.append({
+                            'rate': new_rate,
+                            'prob': path['prob'] * action_prob,
+                            'factor': path['factor']
+                        })
+                paths = new_paths
+
+            for path in paths:
+                daily_interest_factor = 1 + (path['rate'] / 100.0) / self.DAY_COUNT_CONVENTION
+                path['factor'] *= daily_interest_factor
+
+        return sum(path['factor'] * path['prob'] for path in paths)
+
+    def calculate_fair_value(self):
+        # calculate fair value by compounding and taking average
+        pre_contract_scenarios = self._calculate_pre_contract_scenarios()
+
+        total_expected_compounding_factor = 0.0
+        for start_rate, prob in pre_contract_scenarios.items():
+            expected_factor_for_scenario = self._calculate_expected_compounding_factor(
+                start_rate, self.intra_contract_meetings
+            )
+            total_expected_compounding_factor += prob * expected_factor_for_scenario
+
+        days_in_period = (self.end_date - self.start_date).days
+        fair_value_rate = (total_expected_compounding_factor - 1) * (self.DAY_COUNT_CONVENTION / days_in_period)
+        fair_value_rate = fair_value_rate * 100 + self.basis
+        fair_value_price = 100 - fair_value_rate
+
+        return {"fair value rate": f"{fair_value_rate:.5f}", "fair value price": f"{fair_value_price:.5f}"}
+
+
+    # Abstract methods to be implemented by child classes
+    def _get_meeting_dates(self):
+        raise NotImplementedError
+    def _get_current_rate(self):
+        raise NotImplementedError
+    def _get_basis(self):
+        raise NotImplementedError
+
+
+class ThreeMonthSOFRModel(ThreeMonthFutureModel):
+    def __init__(self, x, probabilities, manual_basis=None):
+        super().__init__(x, probabilities, manual_basis)
+        self.DAY_COUNT_CONVENTION = 360.0
+
+    def _get_meeting_dates(self):
+        # Pulls list of meeting dates from BBG, isolate only the meeting dates in the future
+        fed_meeting_dates_df = blp.bds(tickers='FDTR Index', flds='PX225')
+        fed_meeting_dates_df['meeting_dates'] = pd.to_datetime(fed_meeting_dates_df['ecostats_release_date'], format="%Y%m%d")
+        fed_meeting_dates_df = fed_meeting_dates_df.drop('ecostats_release_date', axis=1)
+        future_meetings_df = fed_meeting_dates_df[fed_meeting_dates_df['meeting_dates'] > pd.Timestamp.today()].copy()
+        dates_list = future_meetings_df['meeting_dates'].tolist()
+
+        return dates_list
+
+    def _get_current_rate(self):
+        ffr_rate_df = blp.bdp(tickers='FEDL01 Index', flds=['PX_LAST'])
+        return ffr_rate_df['px_last'].iloc[0]
+
+    def _get_basis(self):
+        # Fetches the 1M SOFR/FF basis and calculates a daily rate.
+        # Construct the 1M SOFR/FF basis ticker for the starting month of the contract
+        MONTH_CODES = {'F': 1, 'G': 2, 'H': 3, 'J': 4, 'K': 5, 'M': 6, 'N': 7, 'Q': 8, 'U': 9, 'V': 10, 'X': 11, 'Z': 12}
+        YEAR_CODES = {'5': 2025, '6': 2026, '7': 2027, '8': 2028, '9': 2029, '0': 2030}
+
+        MONTH_CODES_INV = {v: k for k, v in MONTH_CODES.items()}
+        YEAR_CODES_INV = {v: str(k) for k, v in YEAR_CODES.items()}
+
+        # Parse the initial ticker to pull the market-pricing of basis from BBG, e.g. SFRZ5 -> mean of Z5 basis
+        ticker_list = self.active_ticker.split()[0]
+        if not isinstance(ticker_list, str) or len(ticker_list) < 3:
+            raise ValueError("Invalid ticker")
+
+        start_month_char = ticker_list[-2].upper()
+        start_year_char = ticker_list[-1]
+
+        start_month_num = MONTH_CODES[start_month_char]
+        start_year_num = YEAR_CODES[start_year_char]
+
+        first_month_date = pd.to_datetime(f"{start_year_num}-{start_month_num}-01")
+        second_month_date = first_month_date + pd.DateOffset(months=1)
+        third_month_date = first_month_date + pd.DateOffset(months=2)
+
+        second_month_char = MONTH_CODES_INV[second_month_date.month]
+        second_year_char = YEAR_CODES_INV[second_month_date.year]
+
+        third_month_char = MONTH_CODES_INV[third_month_date.month]
+        third_year_char = YEAR_CODES_INV[third_month_date.year]
+
+        # First month's basis ticker
+        basis_ticker_1 = self.x.replace('SFR', 'SERFF')
+        basis_table = blp.bdp(tickers=basis_ticker_1, flds=['PX_LAST'])
+        basis_1 = basis_table.iloc[0, 0]
+
+        # Second month's basis ticker
+        # Example: 'SFRZ5' -> replace 'Z' with 'F' and '5' with '6'
+        basis_ticker_2 = basis_ticker_1.replace(start_month_char, second_month_char).replace(start_year_char, second_year_char)
+        second_basis_table = blp.bdp(tickers=basis_ticker_2, flds=['PX_LAST'])
+        basis_2 = second_basis_table.iloc[0, 0]
+
+        # Third month's basis ticker
+        basis_ticker_3 = basis_ticker_1.replace(start_month_char, third_month_char).replace(start_year_char, third_year_char)
+        third_basis_table = blp.bdp(tickers=basis_ticker_3, flds=['PX_LAST'])
+        basis_3 = third_basis_table.iloc[0, 0]
+        total_basis = - np.mean([basis_1, basis_2, basis_3])
+        return total_basis
+
+class ThreeMonthSONIAModel(ThreeMonthFutureModel):
+    def __init__(self, x, probabilities, manual_basis=None):
+        super().__init__(x, probabilities, manual_basis)
+        self.DAY_COUNT_CONVENTION = 365.0
+
+    def _get_meeting_dates(self):
+        boe_meeting_dates_df = blp.bds(tickers='UKBRBASE Index', flds='PX225')
+        boe_meeting_dates_df['meeting_dates'] = pd.to_datetime(boe_meeting_dates_df['ecostats_release_date'])
+        boe_meeting_dates_df = boe_meeting_dates_df.drop('ecostats_release_date', axis=1)
+        future_meetings_df = boe_meeting_dates_df[boe_meeting_dates_df['meeting_dates'] > pd.Timestamp.today()]
+        dates_list = future_meetings_df['meeting_dates'].tolist()
+
+        return dates_list
+
+    def _get_current_rate(self):
+        bank_rate_df = blp.bdp(tickers='UKBRBASE Index', flds=['PX_LAST'])
+        bank_rate = bank_rate_df['px_last'].iloc[0]
+        return bank_rate
+
+    def _get_basis(self):
+        # Fetches the 1M SONIA / bank rate basis and calculates a daily rate.
+        # Construct the 1M SONIA / bank rate basis ticker for the starting month of the contract
+        sonia_rate_df = blp.bdp(tickers='SONIO/N Index', flds=['PX_LAST'])
+        sonia_rate = sonia_rate_df['px_last'].iloc[0]
+        bank_rate_df = blp.bdp(tickers='UKBRBASE Index', flds=['PX_LAST'])
+        bank_rate = bank_rate_df['px_last'].iloc[0]
+        basis = sonia_rate - bank_rate  # add this basis to the bank rate to get sonia
+        return basis
+
+
+class ThreeMonthEURIBORModel(ThreeMonthFutureModel):
+    def __init__(self, x, probabilities, manual_basis=None):
+        super().__init__(x, probabilities, manual_basis)
+        self.DAY_COUNT_CONVENTION = 360
+
+    def _get_meeting_dates(self):
+        ecb_meeting_dates_df = blp.bds(tickers='EURODEPO Index', flds='PX225')
+        ecb_meeting_dates_df['meeting_dates'] = pd.to_datetime(ecb_meeting_dates_df['ecostats_release_date'])
+        ecb_meeting_dates_df = ecb_meeting_dates_df.drop('ecostats_release_date', axis=1)
+        future_meetings_df = ecb_meeting_dates_df[ecb_meeting_dates_df['meeting_dates'] > pd.Timestamp.today()]
+        dates_list = future_meetings_df['meeting_dates'].tolist()
+
+        return dates_list
+
+    def _get_current_rate(self):
+        depo_rate_df = blp.bdp(tickers='EURODEPO Index', flds=['PX_LAST'])
+        depo_rate = depo_rate_df['px_last'].iloc[0]
+        return depo_rate
+
+    def _get_basis(self):
+        # To go from depo to Euribor, need to add estr/depo basis then add euribor/estr basis
+        estr_rate_df = blp.bdp(tickers='ESTRON Index', flds=['PX_LAST'])
+        estr_rate = estr_rate_df['px_last'].iloc[0]
+        depo_rate_df = blp.bdp(tickers='EURODEPO Index', flds=['PX_LAST'])
+        depo_rate = depo_rate_df['px_last'].iloc[0]
+        estr_depo_basis = estr_rate - depo_rate  # estr/depo is current estr - current depo from BBG
+
+        basis_ticker_1 = self.x.replace('ER', 'TKAYER')
+        basis_table = blp.bdp(tickers=basis_ticker_1, flds=['PX_LAST'])
+        euribor_estr_basis = basis_table.iloc[0, 0]  # euribor/estr is forward looking basis priced by BBG
+
+        basis = estr_depo_basis + euribor_estr_basis
+        return basis
+
+
+def calculate_future_price(x, meeting_probs, manual_basis=None):
+    # High-level function to calculate the 3m future price.
+
+    if x.startswith('SFR'):
+        model = ThreeMonthSOFRModel(x=x, probabilities=meeting_probs, manual_basis=manual_basis)
+    elif x.startswith('SFI'):
+        model = ThreeMonthSONIAModel(x=x, probabilities=meeting_probs, manual_basis=manual_basis)
+    elif x.startswith('ER'):
+        model = ThreeMonthEURIBORModel(x=x, probabilities=meeting_probs, manual_basis=manual_basis)
+    else:
+        raise ValueError("Unsupported ticker. Please use 'SFR' for SOFR, 'SFI' for SONIA or 'ER' for EURIBOR.")
+
+    return model.calculate_fair_value()
+
+
+def calculate_basis(x, meeting_probs):
+    # High-level function to calculate the basis. Let user check how much of the future price is the basis.
+    # Note: This function doesn't use manual_basis override - it always returns market-priced basis
+
+    if x.startswith('SFR'):
+        model = ThreeMonthSOFRModel(x=x, probabilities=meeting_probs, manual_basis=0)
+    elif x.startswith('SFI'):
+        model = ThreeMonthSONIAModel(x=x, probabilities=meeting_probs, manual_basis=0)
+    elif x.startswith('ER'):
+        model = ThreeMonthEURIBORModel(x=x, probabilities=meeting_probs, manual_basis=0)
+    return model._get_basis()
+
+
+
+
+def bps_to_probabilities(expected_change_bps):
+    """
+    Convert expected change in basis points to probability distribution.
+    Generalizes to any input by interpolating between nearest 25bp multiples.
+    
+    Args:
+        expected_change_bps: Expected change in bps (e.g., -7, +101, etc.)
+    
+    Returns:
+        Dictionary with bp changes as keys and probabilities as values
+        e.g., {-25: 0.72, 0: 0.28} for -7bp input
+        or {100: 0.96, 125: 0.04} for +101bp input
+    """
+    import math
+    
+    # Round to nearest 25bp multiples
+    lower_bound = math.floor(expected_change_bps / 25) * 25
+    upper_bound = math.ceil(expected_change_bps / 25) * 25
+    
+    # If exactly on a 25bp multiple
+    if lower_bound == upper_bound:
+        return {int(lower_bound): 1.0}
+    
+    # Calculate interpolation weights
+    total_range = upper_bound - lower_bound  # Always 25
+    distance_from_lower = expected_change_bps - lower_bound
+    
+    # Weight for upper bound = how far we are from lower (as fraction of 25)
+    weight_upper = distance_from_lower / total_range
+    weight_lower = 1 - weight_upper
+    
+    return {int(lower_bound): weight_lower, int(upper_bound): weight_upper}
+
+
+def get_meeting_dates_for_ticker(ticker):
+    """
+    Get relevant meeting dates for a given ticker by determining the currency
+    and calling the appropriate model's method.
+    Returns: (pre_contract_dates, intra_contract_dates, start_date, end_date)
+    """
+    # We need to get dates without fully instantiating the model
+    # Create a temporary partial model instance just to get contract dates
+    if ticker.upper().startswith('SFR'):
+        temp_model = ThreeMonthSOFRModel.__new__(ThreeMonthSOFRModel)
+    elif ticker.upper().startswith('SFI'):
+        temp_model = ThreeMonthSONIAModel.__new__(ThreeMonthSONIAModel)
+    elif ticker.upper().startswith('ER'):
+        temp_model = ThreeMonthEURIBORModel.__new__(ThreeMonthEURIBORModel)
+    else:
+        raise ValueError("Unsupported ticker. Use 'SFR' for SOFR, 'SFI' for SONIA, or 'ER' for EURIBOR.")
+    
+    # Manually set just what we need to get dates
+    temp_model.x = ticker
+    temp_model.active_ticker = temp_model._get_active_future_ticker()
+    temp_model.start_date, temp_model.end_date = temp_model._get_contract_dates()
+    
+    # Get all future meeting dates
+    all_meeting_dates = temp_model._get_meeting_dates()
+    today = pd.to_datetime(dt.date.today())
+    
+    # Split into pre-contract and intra-contract
+    pre_contract_dates = [date for date in all_meeting_dates 
+                         if today < date < temp_model.start_date]
+    intra_contract_dates = [date for date in all_meeting_dates 
+                           if temp_model.start_date <= date <= temp_model.end_date]
+    
+    return pre_contract_dates, intra_contract_dates, temp_model.start_date, temp_model.end_date
+
+
+# Streamlit Dashboard
+st.title("3-Month Interest Rate Future Pricer")
+st.write("Enter a ticker and your expected rate changes for each meeting to calculate fair value.")
+
+# Ticker input
+ticker_input = st.text_input("Enter Ticker (e.g., SFRZ5, SFIH6, ERZ5)", value="", 
+                             placeholder="SFRZ5 Comdty")
+
+if ticker_input:
+    try:
+        # Get meeting dates for the ticker
+        pre_contract_dates, intra_contract_dates, start_date, end_date = get_meeting_dates_for_ticker(ticker_input)
+        
+        st.success(f"Contract Period: {start_date.date()} to {end_date.date()}")
+        
+        # Initialize session state for inputs if not exists
+        if 'meeting_inputs' not in st.session_state:
+            st.session_state.meeting_inputs = {}
+        
+        all_meeting_changes = {}
+        
+        # Pre-contract meetings input
+        if pre_contract_dates:
+            st.subheader("Pre-Contract Meetings")
+            st.write(f"Found {len(pre_contract_dates)} meeting(s) before contract starts:")
+            
+            for i, meeting_date in enumerate(pre_contract_dates):
+                col1, col2 = st.columns([2, 1])
+                with col1:
+                    st.write(f"**{meeting_date.strftime('%Y-%m-%d')}**")
+                with col2:
+                    change_value = st.number_input(
+                        f"Change (bps)",
+                        value=0.0,
+                        step=1.0,
+                        format="%.1f",
+                        key=f"pre_meeting_{i}",
+                        label_visibility="collapsed"
+                    )
+                    all_meeting_changes[meeting_date] = change_value
+        else:
+            st.info("No meetings before contract starts")
+        
+        # Intra-contract meetings input
+        if intra_contract_dates:
+            st.subheader("Contract Period Meetings")
+            st.write(f"Found {len(intra_contract_dates)} meeting(s) during contract period:")
+            
+            for i, meeting_date in enumerate(intra_contract_dates):
+                col1, col2 = st.columns([2, 1])
+                with col1:
+                    st.write(f"**{meeting_date.strftime('%Y-%m-%d')}**")
+                with col2:
+                    change_value = st.number_input(
+                        f"Change (bps)",
+                        value=0.0,
+                        step=1.0,
+                        format="%.1f",
+                        key=f"intra_meeting_{i}",
+                        label_visibility="collapsed"
+                    )
+                    all_meeting_changes[meeting_date] = change_value
+        else:
+            st.warning(f"No meetings found during contract period")
+        
+        # Basis selection
+        st.subheader("Basis")
+        basis_mode = st.radio(
+            "Basis Mode",
+            options=["Market Pricing", "Manual Override"],
+            index=0,
+            help="Choose whether to use market-priced basis or input your own"
+        )
+        
+        manual_basis_value = None
+        if basis_mode == "Manual Override":
+            manual_basis_value = st.number_input(
+                "Enter Basis (bps)",
+                value=0.0,
+                step=0.1,
+                format="%.2f",
+                help="Enter the basis in basis points"
+            )
+        
+        # Calculate button
+        if st.button("Calculate Fair Value", type="primary"):
+            # Build probability structure for the model
+            # Order: all pre-contract meetings first (chronologically), then all intra-contract meetings
+            probabilities = []
+            
+            # Add pre-contract meeting probabilities
+            for meeting_date in sorted(pre_contract_dates):
+                expected_change = all_meeting_changes[meeting_date]
+                prob_dist = bps_to_probabilities(expected_change)
+                probabilities.append(prob_dist)
+            
+            # Add intra-contract meeting probabilities
+            for meeting_date in sorted(intra_contract_dates):
+                expected_change = all_meeting_changes[meeting_date]
+                prob_dist = bps_to_probabilities(expected_change)
+                probabilities.append(prob_dist)
+            
+            # Calculate fair value
+                try:
+                    result = calculate_future_price(ticker_input, probabilities, manual_basis=manual_basis_value)
+                    
+                    # Display results
+                    st.success("✓ Calculation Complete")
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Fair Value Rate", f"{result['fair value rate']}%")
+                    with col2:
+                        st.metric("Fair Value Price", result['fair value price'])
+                
+                except Exception as e:
+                    st.error(f"Error calculating fair value: {str(e)}")
+    
+    except Exception as e:
+        st.error(f"Error processing ticker: {str(e)}")
+        st.info("Make sure the ticker format is correct (e.g., SFRZ5 Comdty, SFIH6 Comdty, ERZ5 Comdty)")
+
+# Instructions
+with st.sidebar:
+    st.header("Instructions")
+    st.write("""
+    **How to use:**
+    1. Enter a ticker (e.g., SFRZ5 Comdty)
+    2. Enter expected rate change for EACH meeting:
+       - Pre-contract meetings (before contract starts)
+       - Contract period meetings (during contract)
+       - Negative = cuts, Positive = hikes
+       - Model interpolates between 25bp multiples
+    3. Choose basis mode:
+       - Market Pricing (default): Uses Bloomberg data
+       - Manual Override: Input your own basis
+    4. Click "Calculate Fair Value"
+    
+    **How it works:**
+    - Each input creates 1-2 probability paths
+    - e.g., +101bp → 96% at +100bp, 4% at +125bp
+    - Pre-contract paths affect starting rate
+    - Intra-contract paths compound daily
+    
+    **Supported Tickers:**
+    - SOFR, SONIA, EURIBOR
+    
+    **Examples:**
+    - SFRZ5 Comdty (SOFR Dec 2025)
+    - SFIH6 Comdty (SONIA Mar 2026)
+    - ERZ5 Comdty (EURIBOR Dec 2025)
+    """)
+
